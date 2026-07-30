@@ -89,6 +89,65 @@ jobs:
         if: matrix.os == 'windows-latest'
         run: cargo test --release --lib mount::windows::tests
 
+      - name: Windows WinFSP mount smoke test
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          $dataDir = Join-Path $env:RUNNER_TEMP 'rencfs-smoke-data'
+          $stdout = Join-Path $env:RUNNER_TEMP 'rencfs-smoke.stdout.log'
+          $stderr = Join-Path $env:RUNNER_TEMP 'rencfs-smoke.stderr.log'
+          $env:RENCFS_PASSWORD = 'ci-only-smoke-test-password'
+          $arguments = @(
+            'mount',
+            '--mount-point', 'R:',
+            '--data-dir', "`"$dataDir`"",
+            '--log-level', 'WARN'
+          )
+          $rencfsProcess = Start-Process `
+            -FilePath '.\target\release\rencfs.exe' `
+            -ArgumentList $arguments `
+            -RedirectStandardOutput $stdout `
+            -RedirectStandardError $stderr `
+            -PassThru -WindowStyle Hidden
+          try {
+            $mounted = $false
+            for ($attempt = 0; $attempt -lt 60; $attempt++) {
+              if ($rencfsProcess.HasExited) {
+                throw "rencfs exited before mounting (exit $($rencfsProcess.ExitCode))"
+              }
+              if (Test-Path -LiteralPath 'R:\') {
+                $mounted = $true
+                break
+              }
+              Start-Sleep -Milliseconds 500
+            }
+            if (-not $mounted) {
+              throw 'WinFSP mount R: did not appear within 30 seconds'
+            }
+
+            New-Item -ItemType Directory -Path 'R:\smoke' | Out-Null
+            $payload = 'WinFSP end-to-end smoke test'
+            [System.IO.File]::WriteAllText('R:\smoke\hello.txt', $payload)
+            $actual = [System.IO.File]::ReadAllText('R:\smoke\hello.txt')
+            if ($actual -ne $payload) {
+              throw "mounted file contents differ: $actual"
+            }
+            Move-Item -LiteralPath 'R:\smoke\hello.txt' -Destination 'R:\smoke\renamed.txt'
+            Remove-Item -LiteralPath 'R:\smoke\renamed.txt'
+            Remove-Item -LiteralPath 'R:\smoke'
+          }
+          catch {
+            if (Test-Path -LiteralPath $stdout) { Get-Content -LiteralPath $stdout }
+            if (Test-Path -LiteralPath $stderr) { Get-Content -LiteralPath $stderr }
+            throw
+          }
+          finally {
+            if (-not $rencfsProcess.HasExited) {
+              Stop-Process -Id $rencfsProcess.Id -Force
+              $rencfsProcess.WaitForExit()
+            }
+          }
+
       - name: bench
         if: matrix.os == 'ubuntu-latest'
         run: cargo bench --workspace --all-targets --all-features
