@@ -25,7 +25,6 @@ jobs:
       cancel-in-progress: true
     name: build and test
     uses: ./.github/workflows/build_and_tests_reusable.yaml
-    secrets: inherit
 
   package:
     needs: [ version, build_and_test ]

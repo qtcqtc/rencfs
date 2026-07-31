@@ -9,6 +9,14 @@ use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::runtime::Runtime;
 use tracing::{error, info};
+use windows_sys::Win32::{
+    Foundation::{CloseHandle, LocalFree, HANDLE},
+    Security::{
+        Authorization::ConvertSidToStringSidW, GetTokenInformation, TokenUser, TOKEN_QUERY,
+        TOKEN_USER,
+    },
+    System::Threading::{GetCurrentProcess, OpenProcessToken},
+};
 use winfsp_wrs::{
     u16cstr, u16str, CleanupFlags, CreateFileInfo, CreateOptions, DirInfo, FileAccessRights,
     FileAttributes, FileInfo, FileSystem, FileSystemInterface, PSecurityDescriptor, Params,
@@ -30,10 +38,31 @@ use crate::mount::{MountHandleInner, MountPoint};
 const ALLOCATION_UNIT: u64 = 4096;
 const VOLUME_SIZE: u64 = 1024 * 1024 * 1024 * 1024;
 
+struct OwnedHandle(HANDLE);
+
+impl Drop for OwnedHandle {
+    fn drop(&mut self) {
+        unsafe {
+            CloseHandle(self.0);
+        }
+    }
+}
+
+struct LocalAllocation(*mut std::ffi::c_void);
+
+impl Drop for LocalAllocation {
+    fn drop(&mut self) {
+        unsafe {
+            LocalFree(self.0);
+        }
+    }
+}
+
 #[derive(Debug)]
 struct WindowsFileContext {
     ino: u64,
     handle: Mutex<Option<u64>>,
+    directory_entries: Mutex<Option<Vec<(String, FileInfo)>>>,
     is_dir: bool,
     read: bool,
     write: bool,
@@ -53,10 +82,7 @@ impl WindowsFs {
             .enable_all()
             .build()
             .map_err(FsError::from)?;
-        let security_descriptor = SecurityDescriptor::from_wstr(u16cstr!(
-            "O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;WD)"
-        ))
-        .map_err(|_| FsError::Other("cannot create Windows security descriptor"))?;
+        let security_descriptor = default_security_descriptor()?;
         let volume_info = VolumeInfo::new(VOLUME_SIZE, VOLUME_SIZE, u16str!("rencfs"))
             .map_err(|_| FsError::Other("cannot create Windows volume info"))?;
 
@@ -123,6 +149,7 @@ impl WindowsFs {
             return Ok(Arc::new(WindowsFileContext {
                 ino: attr.ino,
                 handle: Mutex::new(None),
+                directory_entries: Mutex::new(None),
                 is_dir: true,
                 read: false,
                 write: false,
@@ -134,6 +161,7 @@ impl WindowsFs {
         Ok(Arc::new(WindowsFileContext {
             ino: attr.ino,
             handle: Mutex::new(Some(handle)),
+            directory_entries: Mutex::new(None),
             is_dir: false,
             read,
             write,
@@ -243,6 +271,7 @@ impl FileSystemInterface for WindowsFs {
         let context = Arc::new(WindowsFileContext {
             ino: attr.ino,
             handle: Mutex::new((handle != 0).then_some(handle)),
+            directory_entries: Mutex::new(None),
             is_dir,
             read,
             write,
@@ -502,18 +531,28 @@ impl FileSystemInterface for WindowsFs {
         if !file_context.is_dir {
             return Err(STATUS_NOT_A_DIRECTORY);
         }
-        let iter = self.block_on(self.fs.read_dir_plus(file_context.ino))?;
         let marker = marker.map(U16CStr::to_string_lossy);
-        let mut entries = Vec::new();
-        for entry in iter {
-            let entry = entry.map_err(fs_error_to_status)?;
-            entries.push((
-                entry.name.expose_secret().to_string(),
-                attr_to_file_info(entry.attr),
-            ));
+        let mut cached_entries = file_context
+            .directory_entries
+            .lock()
+            .map_err(|_| STATUS_INVALID_HANDLE)?;
+        if marker.is_none() || cached_entries.is_none() {
+            let iter = self.block_on(self.fs.read_dir_plus(file_context.ino))?;
+            let mut entries = Vec::new();
+            for entry in iter {
+                let entry = entry.map_err(fs_error_to_status)?;
+                entries.push((
+                    entry.name.expose_secret().to_string(),
+                    attr_to_file_info(entry.attr),
+                ));
+            }
+            entries.sort_by(|left, right| left.0.cmp(&right.0));
+            *cached_entries = Some(entries);
         }
-        entries.sort_by(|left, right| left.0.cmp(&right.0));
+        let entries = cached_entries.as_ref().unwrap().clone();
+        drop(cached_entries);
 
+        let mut exhausted = true;
         for (name, info) in entries {
             if marker
                 .as_deref()
@@ -525,10 +564,69 @@ impl FileSystemInterface for WindowsFs {
                 continue;
             }
             if !add_dir_info(DirInfo::from_str(info, &name)) {
+                exhausted = false;
                 break;
             }
         }
+        if exhausted {
+            file_context
+                .directory_entries
+                .lock()
+                .map_err(|_| STATUS_INVALID_HANDLE)?
+                .take();
+        }
         Ok(())
+    }
+}
+
+fn default_security_descriptor() -> FsResult<SecurityDescriptor> {
+    let user_sid = current_user_sid()?;
+    let descriptor =
+        format!("O:{user_sid}G:{user_sid}D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;{user_sid})");
+    let descriptor = U16CString::from_str(&descriptor)
+        .map_err(|_| FsError::Other("invalid Windows security descriptor"))?;
+    SecurityDescriptor::from_wstr(&descriptor)
+        .map_err(|_| FsError::Other("cannot create Windows security descriptor"))
+}
+
+fn current_user_sid() -> FsResult<String> {
+    unsafe {
+        let mut token = 0;
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+        let _token = OwnedHandle(token);
+
+        let mut required = 0;
+        GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut required);
+        if required == 0 {
+            return Err(FsError::Other("cannot determine Windows token user size"));
+        }
+
+        let word_size = std::mem::size_of::<usize>() as u32;
+        let mut token_info = vec![0_usize; required.div_ceil(word_size) as usize];
+        if GetTokenInformation(
+            token,
+            TokenUser,
+            token_info.as_mut_ptr().cast(),
+            required,
+            &mut required,
+        ) == 0
+        {
+            return Err(io::Error::last_os_error().into());
+        }
+
+        let token_user = &*token_info.as_ptr().cast::<TOKEN_USER>();
+        let mut sid_string = std::ptr::null_mut();
+        if ConvertSidToStringSidW(token_user.User.Sid, &mut sid_string) == 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+        let _sid_string = LocalAllocation(sid_string.cast());
+        let len = (0..)
+            .take_while(|offset| *sid_string.add(*offset) != 0)
+            .count();
+        String::from_utf16(std::slice::from_raw_parts(sid_string, len))
+            .map_err(|_| FsError::Other("Windows user SID is not valid UTF-16"))
     }
 }
 
@@ -740,8 +838,7 @@ mod tests {
     }
 
     fn test_security_descriptor() -> SecurityDescriptor {
-        SecurityDescriptor::from_wstr(u16cstr!("O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;WD)"))
-            .unwrap()
+        default_security_descriptor().unwrap()
     }
 
     fn file_create_info() -> CreateFileInfo {
@@ -795,7 +892,6 @@ mod tests {
                 false,
             ))
             .unwrap();
-        drop(setup_runtime);
 
         let adapter = WindowsFs::new(encrypted_fs, false).unwrap();
         let original_name = U16CString::from_str(r"\hello.txt").unwrap();

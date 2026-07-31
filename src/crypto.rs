@@ -274,6 +274,34 @@ pub fn hash_file_name(name: &SecretString) -> String {
     }
 }
 
+/// Returns every on-disk hash name that can represent `name`, preferring the
+/// native spelling. Dot entries have a second, cross-platform spelling.
+#[must_use]
+pub(crate) fn hash_file_name_candidates(name: &SecretString) -> Vec<String> {
+    match name.expose_secret().as_str() {
+        "$." | "." => {
+            let alternate = if dot_entry_storage_name() == "$dot" {
+                "$."
+            } else {
+                "$dot"
+            };
+            vec![dot_entry_storage_name().to_owned(), alternate.to_owned()]
+        }
+        "$.." | ".." => {
+            let alternate = if dot_dot_entry_storage_name() == "$dotdot" {
+                "$.."
+            } else {
+                "$dotdot"
+            };
+            vec![
+                dot_dot_entry_storage_name().to_owned(),
+                alternate.to_owned(),
+            ]
+        }
+        _ => vec![hex::encode(hash_secret_string(name))],
+    }
+}
+
 #[must_use]
 pub(crate) const fn dot_entry_storage_name() -> &'static str {
     if cfg!(target_os = "windows") {
@@ -601,6 +629,25 @@ mod tests {
         let name = SecretString::new(Box::new(input));
         let result = hash_file_name(&name);
         assert_eq!(result, dot_dot_entry_storage_name());
+    }
+
+    #[test]
+    fn test_hash_file_name_candidates_include_both_platform_spellings() {
+        let dot = SecretString::new(Box::new(".".to_owned()));
+        let dot_candidates = hash_file_name_candidates(&dot);
+        assert_eq!(dot_candidates[0], dot_entry_storage_name());
+        assert!(dot_candidates.iter().any(|candidate| candidate == "$."));
+        assert!(dot_candidates.iter().any(|candidate| candidate == "$dot"));
+
+        let dot_dot = SecretString::new(Box::new("..".to_owned()));
+        let dot_dot_candidates = hash_file_name_candidates(&dot_dot);
+        assert_eq!(dot_dot_candidates[0], dot_dot_entry_storage_name());
+        assert!(dot_dot_candidates
+            .iter()
+            .any(|candidate| candidate == "$.."));
+        assert!(dot_dot_candidates
+            .iter()
+            .any(|candidate| candidate == "$dotdot"));
     }
 
     #[test]

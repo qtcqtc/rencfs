@@ -1946,6 +1946,7 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "tracing-test",
+ "windows-sys 0.52.0",
  "winfsp_wrs",
  "winfsp_wrs_build",
 ]

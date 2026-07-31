@@ -6,6 +6,7 @@ use shush_rs::{ExposeSecret, SecretString};
 use tracing_test::traced_test;
 
 use crate::crypto::Cipher;
+use crate::encryptedfs::storage_entry_path;
 use crate::encryptedfs::write_all_bytes_to_fs;
 use crate::encryptedfs::INODES_DIR;
 use crate::encryptedfs::KEY_ENC_FILENAME;
@@ -14,7 +15,7 @@ use crate::encryptedfs::SECURITY_DIR;
 use crate::encryptedfs::{CopyFileRangeReq, HASH_DIR};
 use crate::encryptedfs::{
     DirectoryEntry, DirectoryEntryPlus, EncryptedFs, FileType, FsError, FsResult, SetFileAttr,
-    CONTENTS_DIR, ROOT_INODE,
+    CONTENTS_DIR, LS_DIR, ROOT_INODE,
 };
 use crate::test_common::run_test;
 use crate::test_common::TestSetup;
@@ -964,6 +965,80 @@ async fn test_find_by_name() {
                     .await
                     .unwrap()
             );
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+#[traced_test]
+async fn test_find_dot_entry_with_non_native_hash_spelling() {
+    run_test(
+        TestSetup {
+            key: "test_find_dot_entry_with_non_native_hash_spelling",
+            read_only: false,
+        },
+        async {
+            let fs = get_fs().await;
+            let dot = SecretString::from_str(".").unwrap();
+            let hash_dir = fs.contents_path(ROOT_INODE).join(HASH_DIR);
+            let ls_dir = fs.contents_path(ROOT_INODE).join(LS_DIR);
+            let candidates = crypto::hash_file_name_candidates(&dot);
+            let native_hash_path = storage_entry_path(&hash_dir, &candidates[0]);
+            let non_native_hash_path = storage_entry_path(&hash_dir, &candidates[1]);
+            let native_ls_path = storage_entry_path(&ls_dir, &candidates[0]);
+            let non_native_ls_path = storage_entry_path(&ls_dir, &candidates[1]);
+
+            std::fs::rename(&native_hash_path, &non_native_hash_path).unwrap();
+            std::fs::rename(&native_ls_path, &non_native_ls_path).unwrap();
+
+            assert!(fs.exists_by_name(ROOT_INODE, &dot).unwrap());
+            assert_eq!(
+                ROOT_INODE,
+                fs.find_by_name(ROOT_INODE, &dot)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .ino
+            );
+            assert_eq!(
+                1,
+                fs.read_dir(ROOT_INODE)
+                    .await
+                    .unwrap()
+                    .filter(|entry| *entry.as_ref().unwrap().name.expose_secret() == ".")
+                    .count()
+            );
+
+            fs.insert_directory_entry(
+                ROOT_INODE,
+                &DirectoryEntry {
+                    ino: ROOT_INODE,
+                    name: dot.clone(),
+                    kind: FileType::Directory,
+                },
+            )
+            .await
+            .unwrap();
+            assert!(!native_hash_path.exists());
+            assert!(non_native_hash_path.exists());
+            assert!(!native_ls_path.exists());
+            assert!(non_native_ls_path.exists());
+
+            fs.remove_directory_entry(ROOT_INODE, &dot).await.unwrap();
+            assert!(!non_native_hash_path.exists());
+            assert!(!non_native_ls_path.exists());
+
+            fs.insert_directory_entry(
+                ROOT_INODE,
+                &DirectoryEntry {
+                    ino: ROOT_INODE,
+                    name: dot,
+                    kind: FileType::Directory,
+                },
+            )
+            .await
+            .unwrap();
         },
     )
     .await;

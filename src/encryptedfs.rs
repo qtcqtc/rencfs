@@ -47,6 +47,17 @@ pub(crate) const HASH_DIR: &str = "hash";
 
 pub(crate) const ROOT_INODE: u64 = 1;
 
+fn storage_entry_path(directory: &Path, name: &str) -> PathBuf {
+    #[cfg(target_os = "windows")]
+    if name.ends_with('.') {
+        if let Ok(verbatim_directory) = directory.canonicalize() {
+            return verbatim_directory.join(name);
+        }
+    }
+
+    directory.join(name)
+}
+
 fn spawn_runtime() -> Runtime {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -842,11 +853,14 @@ impl EncryptedFs {
         if !self.is_dir(parent) {
             return Err(FsError::InvalidInodeType);
         }
-        let hash = crypto::hash_file_name(name);
-        let hash_path = self.contents_path(parent).join(HASH_DIR).join(hash);
-        if !hash_path.is_file() {
+        let hash_dir = self.contents_path(parent).join(HASH_DIR);
+        let Some(hash_path) = crypto::hash_file_name_candidates(name)
+            .into_iter()
+            .map(|hash| storage_entry_path(&hash_dir, &hash))
+            .find(|path| path.is_file())
+        else {
             return Ok(None);
-        }
+        };
         let lock = self
             .serialize_dir_entries_hash_locks
             .get_or_insert_with(hash_path.to_str().unwrap().to_owned(), || {
@@ -1038,9 +1052,11 @@ impl EncryptedFs {
         if !self.is_dir(parent) {
             return Err(FsError::InvalidInodeType);
         }
-        let hash = crypto::hash_file_name(name);
-        let hash_path = self.contents_path(parent).join(HASH_DIR).join(hash);
-        Ok(hash_path.is_file())
+        let hash_dir = self.contents_path(parent).join(HASH_DIR);
+        Ok(crypto::hash_file_name_candidates(name)
+            .into_iter()
+            .map(|hash| storage_entry_path(&hash_dir, &hash))
+            .any(|path| path.is_file()))
     }
 
     #[allow(clippy::missing_errors_doc)]
@@ -1133,28 +1149,33 @@ impl EncryptedFs {
             return Err(e.into());
         }
         let entry = entry.unwrap();
-        let name = entry.file_name().to_string_lossy().to_string();
+        let storage_name = entry.file_name().to_string_lossy().to_string();
+        let entry_path = storage_entry_path(entry.path().parent().unwrap(), &storage_name);
         let name = {
-            if crypto::is_dot_entry_storage_name(&name) {
+            if crypto::is_dot_entry_storage_name(&storage_name) {
                 SecretString::new(Box::new(".".into()))
-            } else if crypto::is_dot_dot_entry_storage_name(&name) {
+            } else if crypto::is_dot_dot_entry_storage_name(&storage_name) {
                 SecretString::from_str("..").unwrap()
             } else {
                 // try from cache
                 let lock = self.get_dir_entries_name_cache().await?;
                 let mut cache = lock.lock().await;
-                if let Some(name_cached) = cache.get(&name).cloned() {
+                if let Some(name_cached) = cache.get(&storage_name).cloned() {
                     name_cached
                 } else {
                     drop(cache);
-                    if let Ok(decrypted_name) =
-                        crypto::decrypt_file_name(&name, self.cipher, &*self.key.get().await?)
-                            .map_err(|err| {
-                                error!(err = %err, "decrypting file name");
-                                err
-                            })
-                    {
-                        lock.lock().await.put(name.clone(), decrypted_name.clone());
+                    if let Ok(decrypted_name) = crypto::decrypt_file_name(
+                        &storage_name,
+                        self.cipher,
+                        &*self.key.get().await?,
+                    )
+                    .map_err(|err| {
+                        error!(err = %err, "decrypting file name");
+                        err
+                    }) {
+                        lock.lock()
+                            .await
+                            .put(storage_name.clone(), decrypted_name.clone());
                         decrypted_name
                     } else {
                         return Err(FsError::InvalidInput("invalid file name"));
@@ -1165,7 +1186,7 @@ impl EncryptedFs {
 
         self.validate_filename(&name)?;
 
-        let file_path = entry.path().to_str().unwrap().to_owned();
+        let file_path = entry_path.to_str().unwrap().to_owned();
         // try from cache
         let lock = self.dir_entries_meta_cache.get().await?;
         let mut cache = lock.lock().await;
@@ -1181,7 +1202,7 @@ impl EncryptedFs {
             .serialize_dir_entries_ls_locks
             .get_or_insert_with(file_path.clone(), || RwLock::new(false));
         let guard = lock.read().await;
-        let file = File::open(entry.path())?;
+        let file = File::open(entry_path)?;
         let res: bincode::Result<(u64, FileType)> = bincode::deserialize_from(crypto::create_read(
             file,
             self.cipher,
@@ -2342,8 +2363,23 @@ impl EncryptedFs {
         entry: &DirectoryEntry,
     ) -> FsResult<()> {
         let parent_path = self.contents_path(ino_contents_dir);
-        let encrypted_name =
-            crypto::encrypt_file_name(&entry.name, self.cipher, &*self.key.get().await?)?;
+        let hash_dir = parent_path.join(HASH_DIR);
+        let ls_dir = parent_path.join(LS_DIR);
+        let hash_candidates = crypto::hash_file_name_candidates(&entry.name);
+        let hash_name = hash_candidates
+            .iter()
+            .find(|name| storage_entry_path(&hash_dir, name).is_file())
+            .unwrap_or(&hash_candidates[0])
+            .clone();
+        let encrypted_name = if hash_candidates.len() > 1 {
+            hash_candidates
+                .iter()
+                .find(|name| storage_entry_path(&ls_dir, name).is_file())
+                .unwrap_or(&hash_candidates[0])
+                .clone()
+        } else {
+            crypto::encrypt_file_name(&entry.name, self.cipher, &*self.key.get().await?)?
+        };
         // add to LS directory
         let self_clone = self
             .self_weak
@@ -2353,14 +2389,12 @@ impl EncryptedFs {
             .unwrap()
             .upgrade()
             .unwrap();
-        let parent_path_clone = parent_path.clone();
+        let ls_dir_clone = ls_dir.clone();
         let encrypted_name_clone = encrypted_name.clone();
         let entry_clone = entry.clone();
         // spawn a task to do concurrently with adding to HASH directory
         let h = tokio::spawn(async move {
-            let file_path = parent_path_clone
-                .join(LS_DIR)
-                .join(encrypted_name_clone.clone());
+            let file_path = storage_entry_path(&ls_dir_clone, &encrypted_name_clone);
             let lock = self_clone
                 .serialize_dir_entries_ls_locks
                 .get_or_insert_with(file_path.to_str().unwrap().to_owned(), || {
@@ -2388,8 +2422,7 @@ impl EncryptedFs {
             .unwrap();
         let entry_hash = entry.clone();
         tokio::spawn(async move {
-            let name = crypto::hash_file_name(&entry_hash.name);
-            let file_path = parent_path.join(HASH_DIR).join(name);
+            let file_path = storage_entry_path(&hash_dir, &hash_name);
             let lock = self_clone
                 .serialize_dir_entries_hash_locks
                 .get_or_insert_with(file_path.to_str().unwrap().to_owned(), || {
@@ -2423,8 +2456,12 @@ impl EncryptedFs {
     async fn remove_directory_entry(&self, parent: u64, name: &SecretString) -> FsResult<()> {
         let parent_path = self.contents_path(parent);
         // remove from HASH
-        let name = crypto::hash_file_name(name);
-        let path = parent_path.join(HASH_DIR).join(name);
+        let hash_dir = parent_path.join(HASH_DIR);
+        let path = crypto::hash_file_name_candidates(name)
+            .into_iter()
+            .map(|hash| storage_entry_path(&hash_dir, &hash))
+            .find(|path| path.is_file())
+            .ok_or(FsError::NotFound("directory entry not found"))?;
         let lock = self
             .serialize_dir_entries_hash_locks
             .get_or_insert_with(path.to_str().unwrap().to_owned(), || RwLock::new(false));
@@ -2438,7 +2475,7 @@ impl EncryptedFs {
         fs::remove_file(path)?;
         drop(guard);
         // remove from LS
-        let path = parent_path.join(LS_DIR).join(name);
+        let path = storage_entry_path(&parent_path.join(LS_DIR), &name);
         let lock = self
             .serialize_dir_entries_ls_locks
             .get_or_insert_with(path.to_str().unwrap().to_owned(), || RwLock::new(false));
