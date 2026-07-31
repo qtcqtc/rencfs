@@ -590,7 +590,7 @@ pub struct EncryptedFs {
     // use std::sync::RwLock instead of tokio::sync::RwLock because we need to use it also in sync code in `DirectoryEntryIterator` and `DirectoryEntryPlusIterator`
     serialize_dir_entries_ls_locks: Arc<ArcHashMap<String, RwLock<bool>>>,
     serialize_dir_entries_hash_locks: Arc<ArcHashMap<String, RwLock<bool>>>,
-    directory_entry_mutation_lock: Mutex<()>,
+    directory_entry_mutation_locks: ArcHashMap<u64, Mutex<()>>,
     read_write_locks: ArcHashMap<u64, RwLock<bool>>,
     key: ExpireValue<SecretVec<u8>, FsError, KeyProvider>,
     self_weak: std::sync::Mutex<Option<Weak<Self>>>,
@@ -604,6 +604,10 @@ pub struct EncryptedFs {
     requested_read: Mutex<HashMap<u64, AtomicU64>>,
     #[cfg(test)]
     rename_fail_after_destination: AtomicBool,
+    #[cfg(test)]
+    directory_entry_fail_hash_write: AtomicBool,
+    #[cfg(test)]
+    directory_entry_fail_hash_remove: AtomicBool,
     read_only: bool,
 }
 
@@ -639,7 +643,7 @@ impl EncryptedFs {
             serialize_update_inode_locks: ArcHashMap::default(),
             serialize_dir_entries_ls_locks: Arc::new(ArcHashMap::default()),
             serialize_dir_entries_hash_locks: Arc::new(ArcHashMap::default()),
-            directory_entry_mutation_lock: Mutex::new(()),
+            directory_entry_mutation_locks: ArcHashMap::default(),
             key,
             self_weak: std::sync::Mutex::new(None),
             read_write_locks: ArcHashMap::default(),
@@ -660,6 +664,10 @@ impl EncryptedFs {
             requested_read: Mutex::default(),
             #[cfg(test)]
             rename_fail_after_destination: AtomicBool::new(false),
+            #[cfg(test)]
+            directory_entry_fail_hash_write: AtomicBool::new(false),
+            #[cfg(test)]
+            directory_entry_fail_hash_remove: AtomicBool::new(false),
             read_only,
         };
 
@@ -717,7 +725,10 @@ impl EncryptedFs {
         if self.read_only {
             return Err(FsError::ReadOnly);
         }
-        let _mutation_guard = self.directory_entry_mutation_lock.lock().await;
+        let mutation_lock = self
+            .directory_entry_mutation_locks
+            .get_or_insert_with(parent, || Mutex::new(()));
+        let _mutation_guard = mutation_lock.lock().await;
         if *name.expose_secret() == "." || *name.expose_secret() == ".." {
             return Err(FsError::InvalidInput("name cannot be '.' or '..'"));
         }
@@ -924,7 +935,10 @@ impl EncryptedFs {
         if self.read_only {
             return Err(FsError::ReadOnly);
         }
-        let _mutation_guard = self.directory_entry_mutation_lock.lock().await;
+        let mutation_lock = self
+            .directory_entry_mutation_locks
+            .get_or_insert_with(parent, || Mutex::new(()));
+        let _mutation_guard = mutation_lock.lock().await;
         if !self.is_dir(parent) {
             return Err(FsError::InvalidInodeType);
         }
@@ -1002,7 +1016,10 @@ impl EncryptedFs {
         if self.read_only {
             return Err(FsError::ReadOnly);
         }
-        let _mutation_guard = self.directory_entry_mutation_lock.lock().await;
+        let mutation_lock = self
+            .directory_entry_mutation_locks
+            .get_or_insert_with(parent, || Mutex::new(()));
+        let _mutation_guard = mutation_lock.lock().await;
         if !self.is_dir(parent) {
             return Err(FsError::InvalidInodeType);
         }
@@ -2058,7 +2075,23 @@ impl EncryptedFs {
         if self.read_only {
             return Err(FsError::ReadOnly);
         }
-        let _mutation_guard = self.directory_entry_mutation_lock.lock().await;
+        // Lock both namespace parents in inode order so unrelated directories
+        // remain concurrent and cross-directory renames cannot deadlock.
+        let first_parent = parent.min(new_parent);
+        let second_parent = parent.max(new_parent);
+        let first_mutation_lock = self
+            .directory_entry_mutation_locks
+            .get_or_insert_with(first_parent, || Mutex::new(()));
+        let _first_mutation_guard = first_mutation_lock.lock().await;
+        let second_mutation_lock = (second_parent != first_parent).then(|| {
+            self.directory_entry_mutation_locks
+                .get_or_insert_with(second_parent, || Mutex::new(()))
+        });
+        let _second_mutation_guard = if let Some(lock) = second_mutation_lock.as_ref() {
+            Some(lock.lock().await)
+        } else {
+            None
+        };
         if !self.exists(parent) {
             return Err(FsError::InodeNotFound);
         }
@@ -2607,6 +2640,17 @@ impl EncryptedFs {
     }
 
     async fn write_directory_entry_storage(&self, storage: &DirectoryEntryStorage) -> FsResult<()> {
+        let previous_hash = match fs::read(&storage.hash_path) {
+            Ok(contents) => Some(contents),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+        let previous_ls = match fs::read(&storage.ls_path) {
+            Ok(contents) => Some(contents),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+
         // add to LS directory
         let self_clone = self
             .self_weak
@@ -2619,7 +2663,7 @@ impl EncryptedFs {
         let ls_path = storage.ls_path.clone();
         let entry_clone = storage.entry.clone();
         // spawn a task to do concurrently with adding to HASH directory
-        let h = tokio::spawn(async move {
+        let ls_handle = tokio::spawn(async move {
             let lock = self_clone
                 .serialize_dir_entries_ls_locks
                 .get_or_insert_with(ls_path.to_str().unwrap().to_owned(), || RwLock::new(false));
@@ -2646,13 +2690,22 @@ impl EncryptedFs {
         let entry_hash = storage.entry.clone();
         let encrypted_name = storage.encrypted_name.clone();
         let hash_path = storage.hash_path.clone();
-        let hash_result = tokio::spawn(async move {
+        let hash_handle = tokio::spawn(async move {
             let lock = self_clone
                 .serialize_dir_entries_hash_locks
                 .get_or_insert_with(hash_path.to_str().unwrap().to_owned(), || {
                     RwLock::new(false)
                 });
             let _guard = lock.write().await;
+            #[cfg(test)]
+            if self_clone
+                .directory_entry_fail_hash_write
+                .swap(false, Ordering::SeqCst)
+            {
+                return Err(FsError::Other(
+                    "injected directory-entry hash write failure",
+                ));
+            }
             // write inode and file type
             // we save the encrypted name also because we need it to remove the entry on [`remove_directory_entry`]
             let entry = (entry_hash.ino, entry_hash.kind, encrypted_name);
@@ -2663,18 +2716,90 @@ impl EncryptedFs {
                 &*self_clone.key.get().await?,
             )?;
             Ok::<(), FsError>(())
-        })
-        .await?;
-        let ls_result = h.await?;
-        hash_result?;
-        ls_result?;
-        self.dir_entries_meta_cache
-            .get()
-            .await?
-            .lock()
-            .await
-            .pop(&storage.ls_path.to_string_lossy().to_string());
+        });
+
+        // Always await both halves. If either fails, restore the exact previous
+        // bytes (or remove a newly-created half) so lookups and listings cannot
+        // disagree about whether the entry exists.
+        let hash_result = hash_handle.await.map_err(FsError::from).and_then(|r| r);
+        let ls_result = ls_handle.await.map_err(FsError::from).and_then(|r| r);
+        let write_error = match (hash_result, ls_result) {
+            (Err(error), _) | (Ok(()), Err(error)) => Some(error),
+            (Ok(()), Ok(())) => None,
+        };
+        if let Some(error) = write_error {
+            if let Err(rollback_error) = self
+                .restore_directory_entry_file(&storage.hash_path, previous_hash.as_deref(), true)
+                .await
+            {
+                error!(
+                    err = %rollback_error,
+                    "failed to restore directory-entry hash after write failure"
+                );
+            }
+            if let Err(rollback_error) = self
+                .restore_directory_entry_file(&storage.ls_path, previous_ls.as_deref(), false)
+                .await
+            {
+                error!(
+                    err = %rollback_error,
+                    "failed to restore directory-entry listing after write failure"
+                );
+            }
+            return Err(error);
+        }
+
+        self.invalidate_directory_entry_meta_cache(&storage.ls_path)
+            .await;
         Ok(())
+    }
+
+    async fn restore_directory_entry_file(
+        &self,
+        path: &Path,
+        previous_contents: Option<&[u8]>,
+        is_hash_entry: bool,
+    ) -> FsResult<()> {
+        let locks = if is_hash_entry {
+            &self.serialize_dir_entries_hash_locks
+        } else {
+            &self.serialize_dir_entries_ls_locks
+        };
+        let lock =
+            locks.get_or_insert_with(path.to_str().unwrap().to_owned(), || RwLock::new(false));
+        let _guard = lock.write().await;
+        if let Some(previous_contents) = previous_contents {
+            let parent = path
+                .parent()
+                .ok_or(FsError::Other("directory entry has no parent"))?;
+            let mut file = fs_util::open_atomic_write(path)?;
+            file.write_all(previous_contents)?;
+            file.commit()?;
+            fs_util::sync_directory(parent)?;
+        } else {
+            match fs::remove_file(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        drop(_guard);
+        if !is_hash_entry {
+            self.invalidate_directory_entry_meta_cache(path).await;
+        }
+        Ok(())
+    }
+
+    async fn invalidate_directory_entry_meta_cache(&self, path: &Path) {
+        match self.dir_entries_meta_cache.get().await {
+            Ok(cache) => {
+                cache.lock().await.pop(&path.to_string_lossy().to_string());
+            }
+            Err(error) => warn!(
+                err = %error,
+                "directory entry changed but its metadata cache could not be invalidated"
+            ),
+        }
     }
 
     async fn find_directory_entry_storage(
@@ -2721,6 +2846,15 @@ impl EncryptedFs {
             .serialize_dir_entries_hash_locks
             .get_or_insert_with(path.to_str().unwrap().to_owned(), || RwLock::new(false));
         let _guard = lock.write().await;
+        #[cfg(test)]
+        if self
+            .directory_entry_fail_hash_remove
+            .swap(false, Ordering::SeqCst)
+        {
+            return Err(FsError::Other(
+                "injected directory-entry hash removal failure",
+            ));
+        }
         match fs::remove_file(path) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -2738,12 +2872,7 @@ impl EncryptedFs {
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(error.into()),
         };
-        self.dir_entries_meta_cache
-            .get()
-            .await?
-            .lock()
-            .await
-            .pop(&path.to_string_lossy().to_string());
+        self.invalidate_directory_entry_meta_cache(path).await;
         result
     }
 
@@ -2760,10 +2889,20 @@ impl EncryptedFs {
             .find_directory_entry_storage(parent, name)
             .await?
             .ok_or(FsError::NotFound("directory entry not found"))?;
-        self.remove_directory_entry_hash_file(&storage.hash_path)
-            .await?;
         self.remove_directory_entry_ls_file(&storage.ls_path)
             .await?;
+        if let Err(error) = self
+            .remove_directory_entry_hash_file(&storage.hash_path)
+            .await
+        {
+            if let Err(rollback_error) = self.write_directory_entry_storage(&storage).await {
+                error!(
+                    err = %rollback_error,
+                    "failed to restore directory entry after removal failure"
+                );
+            }
+            return Err(error);
+        }
         Ok(())
     }
 

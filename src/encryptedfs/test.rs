@@ -2540,6 +2540,68 @@ async fn _test_sample() {
 
 #[tokio::test]
 #[traced_test]
+async fn test_directory_entry_pair_rolls_back_on_partial_failure() {
+    run_test(
+        TestSetup {
+            key: "test_directory_entry_pair_rolls_back_on_partial_failure",
+            read_only: false,
+        },
+        async {
+            let fs = get_fs().await;
+            let name = SecretString::from_str("transactional-entry").unwrap();
+            let entry = DirectoryEntry {
+                ino: ROOT_INODE,
+                name: name.clone(),
+                kind: FileType::Directory,
+            };
+
+            fs.directory_entry_fail_hash_write
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            assert!(matches!(
+                fs.insert_directory_entry(ROOT_INODE, &entry).await,
+                Err(FsError::Other(
+                    "injected directory-entry hash write failure"
+                ))
+            ));
+            assert!(!fs.exists_by_name(ROOT_INODE, &name).unwrap());
+            assert_eq!(
+                fs.read_dir(ROOT_INODE)
+                    .await
+                    .unwrap()
+                    .map(Result::unwrap)
+                    .filter(|candidate| candidate.name.expose_secret() == name.expose_secret())
+                    .count(),
+                0
+            );
+
+            fs.insert_directory_entry(ROOT_INODE, &entry).await.unwrap();
+            fs.directory_entry_fail_hash_remove
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            assert!(matches!(
+                fs.remove_directory_entry(ROOT_INODE, &name).await,
+                Err(FsError::Other(
+                    "injected directory-entry hash removal failure"
+                ))
+            ));
+            assert!(fs.exists_by_name(ROOT_INODE, &name).unwrap());
+            assert_eq!(
+                fs.read_dir(ROOT_INODE)
+                    .await
+                    .unwrap()
+                    .map(Result::unwrap)
+                    .filter(|candidate| candidate.name.expose_secret() == name.expose_secret())
+                    .count(),
+                1
+            );
+
+            fs.remove_directory_entry(ROOT_INODE, &name).await.unwrap();
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+#[traced_test]
 #[allow(clippy::too_many_lines)]
 async fn test_read_only_create() {
     run_test(
