@@ -50,8 +50,15 @@ pub(crate) const ROOT_INODE: u64 = 1;
 fn storage_entry_path(directory: &Path, name: &str) -> PathBuf {
     #[cfg(target_os = "windows")]
     if name.ends_with('.') {
-        if let Ok(verbatim_directory) = directory.canonicalize() {
-            return verbatim_directory.join(name);
+        match directory.canonicalize() {
+            Ok(verbatim_directory) => return verbatim_directory.join(name),
+            Err(error) => {
+                warn!(
+                    ?directory,
+                    %error,
+                    "failed to canonicalize backing directory for a trailing-dot entry"
+                );
+            }
         }
     }
 
