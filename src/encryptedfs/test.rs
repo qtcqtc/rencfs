@@ -1750,7 +1750,7 @@ async fn test_rename() {
                 )
                 .await
                 .unwrap();
-            let (_, _attr_2) = fs
+            let (_, attr_2) = fs
                 .create(
                     new_parent,
                     &file_2,
@@ -1760,6 +1760,27 @@ async fn test_rename() {
                 )
                 .await
                 .unwrap();
+            assert!(matches!(
+                fs.rename_with_options(ROOT_INODE, &file_1, new_parent, &file_2, false)
+                    .await,
+                Err(FsError::AlreadyExists)
+            ));
+            assert_eq!(
+                fs.find_by_name(ROOT_INODE, &file_1)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .ino,
+                attr.ino
+            );
+            assert_eq!(
+                fs.find_by_name(new_parent, &file_2)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .ino,
+                attr_2.ino
+            );
             fs.rename(ROOT_INODE, &file_1, new_parent, &file_2)
                 .await
                 .unwrap();
@@ -1767,6 +1788,8 @@ async fn test_rename() {
             assert!(fs.exists_by_name(new_parent, &file_2).unwrap());
             let new_attr = fs.find_by_name(new_parent, &file_2).await.unwrap().unwrap();
             assert!(fs.is_file(new_attr.ino));
+            assert!(!fs.exists(attr_2.ino));
+            assert!(!fs.is_file(attr_2.ino));
             assert_eq!(new_attr.ino, attr.ino);
             assert_eq!(new_attr.kind, attr.kind);
             assert_eq!(
@@ -1800,7 +1823,7 @@ async fn test_rename() {
                 )
                 .await
                 .unwrap();
-            let (_, _attr_2) = fs
+            let (_, attr_2) = fs
                 .create(
                     new_parent,
                     &dir_2,
@@ -1817,6 +1840,8 @@ async fn test_rename() {
             assert!(fs.exists_by_name(new_parent, &dir_2).unwrap());
             let new_attr = fs.find_by_name(new_parent, &dir_2).await.unwrap().unwrap();
             assert!(fs.is_dir(new_attr.ino));
+            assert!(!fs.exists(attr_2.ino));
+            assert!(!fs.is_dir(attr_2.ino));
             assert_eq!(new_attr.ino, attr.ino);
             assert_eq!(new_attr.kind, attr.kind);
             assert_eq!(
@@ -2344,6 +2369,114 @@ async fn test_rename() {
                     .await,
                 Err(FsError::InvalidInodeType)
             ));
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+#[traced_test]
+async fn test_rename_replacement_rolls_back_on_failure() {
+    run_test(
+        TestSetup {
+            key: "test_rename_replacement_rolls_back_on_failure",
+            read_only: false,
+        },
+        async {
+            let fs = get_fs().await;
+            let source = SecretString::from_str("source").unwrap();
+            let destination = SecretString::from_str("destination").unwrap();
+
+            let (source_handle, source_attr) = fs
+                .create(
+                    ROOT_INODE,
+                    &source,
+                    create_attr(FileType::RegularFile),
+                    false,
+                    true,
+                )
+                .await
+                .unwrap();
+            write_all_bytes_to_fs(&fs, source_attr.ino, 0, b"source data", source_handle)
+                .await
+                .unwrap();
+            fs.flush(source_handle).await.unwrap();
+            fs.release(source_handle).await.unwrap();
+
+            let (destination_handle, destination_attr) = fs
+                .create(
+                    ROOT_INODE,
+                    &destination,
+                    create_attr(FileType::RegularFile),
+                    false,
+                    true,
+                )
+                .await
+                .unwrap();
+            write_all_bytes_to_fs(
+                &fs,
+                destination_attr.ino,
+                0,
+                b"destination data",
+                destination_handle,
+            )
+            .await
+            .unwrap();
+            fs.flush(destination_handle).await.unwrap();
+            fs.release(destination_handle).await.unwrap();
+
+            fs.rename_fail_after_destination
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            assert!(matches!(
+                fs.rename_with_options(ROOT_INODE, &source, ROOT_INODE, &destination, true)
+                    .await,
+                Err(FsError::Other("injected rename failure"))
+            ));
+
+            assert_eq!(
+                fs.find_by_name(ROOT_INODE, &source)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .ino,
+                source_attr.ino
+            );
+            assert_eq!(
+                fs.find_by_name(ROOT_INODE, &destination)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .ino,
+                destination_attr.ino
+            );
+            assert_eq!(
+                test_common::read_to_string(source_attr.ino, &fs).await,
+                "source data"
+            );
+            assert_eq!(
+                test_common::read_to_string(destination_attr.ino, &fs).await,
+                "destination data"
+            );
+            let entries: Vec<_> = fs
+                .read_dir(ROOT_INODE)
+                .await
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            assert_eq!(
+                entries
+                    .iter()
+                    .filter(|entry| entry.name.expose_secret() == source.expose_secret())
+                    .count(),
+                1
+            );
+            assert_eq!(
+                entries
+                    .iter()
+                    .filter(|entry| entry.name.expose_secret() == destination.expose_secret())
+                    .count(),
+                1
+            );
         },
     )
     .await;

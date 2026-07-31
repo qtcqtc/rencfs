@@ -13,6 +13,8 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::num::{NonZeroUsize, ParseIntError};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+#[cfg(test)]
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Weak};
 use std::time::{Duration, SystemTime};
@@ -429,6 +431,14 @@ pub struct DirectoryEntry {
     pub kind: FileType,
 }
 
+#[derive(Debug, Clone)]
+struct DirectoryEntryStorage {
+    entry: DirectoryEntry,
+    hash_path: PathBuf,
+    ls_path: PathBuf,
+    encrypted_name: String,
+}
+
 impl PartialEq for DirectoryEntry {
     fn eq(&self, other: &Self) -> bool {
         self.ino == other.ino
@@ -580,6 +590,7 @@ pub struct EncryptedFs {
     // use std::sync::RwLock instead of tokio::sync::RwLock because we need to use it also in sync code in `DirectoryEntryIterator` and `DirectoryEntryPlusIterator`
     serialize_dir_entries_ls_locks: Arc<ArcHashMap<String, RwLock<bool>>>,
     serialize_dir_entries_hash_locks: Arc<ArcHashMap<String, RwLock<bool>>>,
+    directory_entry_mutation_lock: Mutex<()>,
     read_write_locks: ArcHashMap<u64, RwLock<bool>>,
     key: ExpireValue<SecretVec<u8>, FsError, KeyProvider>,
     self_weak: std::sync::Mutex<Option<Weak<Self>>>,
@@ -591,6 +602,8 @@ pub struct EncryptedFs {
     sizes_write: Mutex<HashMap<u64, AtomicU64>>,
     sizes_read: Mutex<HashMap<u64, AtomicU64>>,
     requested_read: Mutex<HashMap<u64, AtomicU64>>,
+    #[cfg(test)]
+    rename_fail_after_destination: AtomicBool,
     read_only: bool,
 }
 
@@ -626,6 +639,7 @@ impl EncryptedFs {
             serialize_update_inode_locks: ArcHashMap::default(),
             serialize_dir_entries_ls_locks: Arc::new(ArcHashMap::default()),
             serialize_dir_entries_hash_locks: Arc::new(ArcHashMap::default()),
+            directory_entry_mutation_lock: Mutex::new(()),
             key,
             self_weak: std::sync::Mutex::new(None),
             read_write_locks: ArcHashMap::default(),
@@ -644,6 +658,8 @@ impl EncryptedFs {
             sizes_write: Mutex::default(),
             sizes_read: Mutex::default(),
             requested_read: Mutex::default(),
+            #[cfg(test)]
+            rename_fail_after_destination: AtomicBool::new(false),
             read_only,
         };
 
@@ -701,6 +717,7 @@ impl EncryptedFs {
         if self.read_only {
             return Err(FsError::ReadOnly);
         }
+        let _mutation_guard = self.directory_entry_mutation_lock.lock().await;
         if *name.expose_secret() == "." || *name.expose_secret() == ".." {
             return Err(FsError::InvalidInput("name cannot be '.' or '..'"));
         }
@@ -907,6 +924,7 @@ impl EncryptedFs {
         if self.read_only {
             return Err(FsError::ReadOnly);
         }
+        let _mutation_guard = self.directory_entry_mutation_lock.lock().await;
         if !self.is_dir(parent) {
             return Err(FsError::InvalidInodeType);
         }
@@ -984,6 +1002,7 @@ impl EncryptedFs {
         if self.read_only {
             return Err(FsError::ReadOnly);
         }
+        let _mutation_guard = self.directory_entry_mutation_lock.lock().await;
         if !self.is_dir(parent) {
             return Err(FsError::InvalidInodeType);
         }
@@ -2023,9 +2042,23 @@ impl EncryptedFs {
         new_parent: u64,
         new_name: &SecretString,
     ) -> FsResult<()> {
+        self.rename_with_options(parent, name, new_parent, new_name, true)
+            .await
+    }
+
+    #[allow(clippy::missing_panics_doc)]
+    pub async fn rename_with_options(
+        &self,
+        parent: u64,
+        name: &SecretString,
+        new_parent: u64,
+        new_name: &SecretString,
+        replace_if_exists: bool,
+    ) -> FsResult<()> {
         if self.read_only {
             return Err(FsError::ReadOnly);
         }
+        let _mutation_guard = self.directory_entry_mutation_lock.lock().await;
         if !self.exists(parent) {
             return Err(FsError::InodeNotFound);
         }
@@ -2048,63 +2081,230 @@ impl EncryptedFs {
             return Ok(());
         }
 
-        // Only overwrite an existing directory if it's empty
-        if let Ok(Some(new_attr)) = self.find_by_name(new_parent, new_name).await {
-            if new_attr.kind == FileType::Directory && self.len(new_attr.ino)? > 0 {
+        let source_storage = self
+            .find_directory_entry_storage(parent, name)
+            .await?
+            .ok_or(FsError::NotFound("name not found"))?;
+        let attr = self
+            .get_inode_from_cache_or_storage(source_storage.entry.ino)
+            .await?;
+        let replaced_storage = self
+            .find_directory_entry_storage(new_parent, new_name)
+            .await?;
+        if let Some(replaced_storage) = replaced_storage.as_ref() {
+            if !replace_if_exists {
+                return Err(FsError::AlreadyExists);
+            }
+            if replaced_storage.entry.kind == FileType::Directory
+                && self.len(replaced_storage.entry.ino)? > 0
+            {
                 return Err(FsError::NotEmpty);
             }
         }
 
-        let attr = self
-            .find_by_name(parent, name)
-            .await?
-            .ok_or(FsError::NotFound("name not found"))?;
-        // remove from parent contents
-        self.remove_directory_entry(parent, name).await?;
-        // remove from new_parent contents, if exists
-        if self.exists_by_name(new_parent, new_name)? {
-            self.remove_directory_entry(new_parent, new_name).await?;
-        }
-        // add to new parent contents
-        self.insert_directory_entry(
-            new_parent,
-            &DirectoryEntry {
-                ino: attr.ino,
-                name: new_name.clone(),
-                kind: attr.kind,
-            },
-        )
-        .await?;
-
-        if attr.kind == FileType::Directory {
-            // add the parent link to the new directory
-            self.insert_directory_entry(
-                attr.ino,
-                &DirectoryEntry {
-                    ino: new_parent,
-                    name: SecretBox::new(Box::new("$..".to_owned())),
-                    kind: FileType::Directory,
-                },
-            )
+        let destination_entry = DirectoryEntry {
+            ino: attr.ino,
+            name: new_name.clone(),
+            kind: attr.kind,
+        };
+        let destination_storage = self
+            .prepare_directory_entry_storage(new_parent, &destination_entry)
             .await?;
+        let parent_link_changed = attr.kind == FileType::Directory && parent != new_parent;
+        let old_parent_link = if parent_link_changed {
+            self.find_directory_entry_storage(attr.ino, &SecretBox::new(Box::new("$..".to_owned())))
+                .await?
+        } else {
+            None
+        };
+        let new_parent_link = if parent_link_changed {
+            Some(
+                self.prepare_directory_entry_storage(
+                    attr.ino,
+                    &DirectoryEntry {
+                        ino: new_parent,
+                        name: SecretBox::new(Box::new("$..".to_owned())),
+                        kind: FileType::Directory,
+                    },
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+
+        // Commit the destination before removing the source. If a later step
+        // fails, the original inode data is still intact and the entries below
+        // can be restored while the namespace mutation lock is held.
+        if let Err(error) = self
+            .write_directory_entry_storage(&destination_storage)
+            .await
+        {
+            self.restore_replaced_directory_entry(&destination_storage, replaced_storage.as_ref())
+                .await;
+            return Err(error);
+        }
+        #[cfg(test)]
+        if self
+            .rename_fail_after_destination
+            .swap(false, Ordering::SeqCst)
+        {
+            self.restore_replaced_directory_entry(&destination_storage, replaced_storage.as_ref())
+                .await;
+            return Err(FsError::Other("injected rename failure"));
+        }
+
+        if let Some(storage) = new_parent_link.as_ref() {
+            if let Err(error) = self.write_directory_entry_storage(storage).await {
+                self.restore_replaced_directory_entry(storage, old_parent_link.as_ref())
+                    .await;
+                self.restore_replaced_directory_entry(
+                    &destination_storage,
+                    replaced_storage.as_ref(),
+                )
+                .await;
+                return Err(error);
+            }
+        }
+
+        if let Err(error) = self.remove_directory_entry(parent, name).await {
+            if let Err(rollback_error) = self.write_directory_entry_storage(&source_storage).await {
+                error!(
+                    err = %rollback_error,
+                    "failed to restore source directory entry after rename failure"
+                );
+            }
+            if let Some(new_parent_link) = new_parent_link.as_ref() {
+                self.restore_replaced_directory_entry(new_parent_link, old_parent_link.as_ref())
+                    .await;
+            }
+            self.restore_replaced_directory_entry(&destination_storage, replaced_storage.as_ref())
+                .await;
+            return Err(error);
+        }
+
+        if let Some(replaced_storage) = replaced_storage.as_ref() {
+            if replaced_storage.ls_path != destination_storage.ls_path {
+                if let Err(error) = self
+                    .remove_directory_entry_ls_file(&replaced_storage.ls_path)
+                    .await
+                {
+                    warn!(
+                        err = %error,
+                        "renamed successfully but could not remove replaced directory listing"
+                    );
+                }
+            }
+        }
+
+        // The new namespace is now committed. Deleting replaced inode storage
+        // is intentionally deferred until this point so a failed rename never
+        // destroys the original destination.
+        if let Some(replaced_storage) =
+            replaced_storage.filter(|storage| storage.entry.ino != attr.ino)
+        {
+            if let Err(error) = self
+                .remove_replaced_inode_storage(&replaced_storage.entry)
+                .await
+            {
+                warn!(
+                    ino = replaced_storage.entry.ino,
+                    err = %error,
+                    "renamed successfully but could not remove replaced inode storage"
+                );
+            }
         }
 
         let now = SystemTime::now();
-        let set_attr = SetFileAttr::default()
+        let parent_times = SetFileAttr::default()
             .with_mtime(now)
             .with_ctime(now)
             .with_atime(now);
-        self.set_attr(parent, set_attr).await?;
+        if let Err(error) = self.set_attr(parent, parent_times).await {
+            warn!(
+                ino = parent,
+                err = %error,
+                "renamed successfully but could not update source parent timestamps"
+            );
+        }
+        if new_parent != parent {
+            if let Err(error) = self.set_attr(new_parent, parent_times).await {
+                warn!(
+                    ino = new_parent,
+                    err = %error,
+                    "renamed successfully but could not update destination parent timestamps"
+                );
+            }
+        }
+        if let Err(error) = self
+            .set_attr(
+                attr.ino,
+                SetFileAttr::default().with_ctime(now).with_atime(now),
+            )
+            .await
+        {
+            warn!(
+                ino = attr.ino,
+                err = %error,
+                "renamed successfully but could not update inode timestamps"
+            );
+        }
 
-        let set_attr = SetFileAttr::default()
-            .with_mtime(now)
-            .with_ctime(now)
-            .with_atime(now);
-        self.set_attr(new_parent, set_attr).await?;
+        Ok(())
+    }
 
-        let set_attr = SetFileAttr::default().with_ctime(now).with_atime(now);
-        self.set_attr(attr.ino, set_attr).await?;
+    async fn restore_replaced_directory_entry(
+        &self,
+        new_storage: &DirectoryEntryStorage,
+        replaced_storage: Option<&DirectoryEntryStorage>,
+    ) {
+        let result = if let Some(replaced_storage) = replaced_storage {
+            self.write_directory_entry_storage(replaced_storage).await
+        } else {
+            self.remove_directory_entry_hash_file(&new_storage.hash_path)
+                .await
+        };
+        if let Err(error) = result {
+            error!(
+                err = %error,
+                "failed to restore replaced directory entry after rename failure"
+            );
+        }
+        let remove_new_listing = match replaced_storage {
+            Some(storage) => storage.ls_path != new_storage.ls_path,
+            None => true,
+        };
+        if remove_new_listing {
+            if let Err(error) = self
+                .remove_directory_entry_ls_file(&new_storage.ls_path)
+                .await
+            {
+                error!(
+                    err = %error,
+                    "failed to remove new directory listing after rename failure"
+                );
+            }
+        }
+    }
 
+    async fn remove_replaced_inode_storage(&self, entry: &DirectoryEntry) -> FsResult<()> {
+        {
+            let lock = self
+                .serialize_inode_locks
+                .get_or_insert_with(entry.ino, || RwLock::new(false));
+            let _guard = lock.write();
+            fs::remove_file(self.ino_file(entry.ino))?;
+        }
+        match entry.kind {
+            FileType::Directory => fs::remove_dir_all(self.contents_path(entry.ino))?,
+            FileType::RegularFile => fs::remove_file(self.contents_path(entry.ino))?,
+        }
+        self.attr_cache
+            .get()
+            .await?
+            .write()
+            .await
+            .demote(&entry.ino);
         Ok(())
     }
 
@@ -2369,6 +2569,17 @@ impl EncryptedFs {
         ino_contents_dir: u64,
         entry: &DirectoryEntry,
     ) -> FsResult<()> {
+        let storage = self
+            .prepare_directory_entry_storage(ino_contents_dir, entry)
+            .await?;
+        self.write_directory_entry_storage(&storage).await
+    }
+
+    async fn prepare_directory_entry_storage(
+        &self,
+        ino_contents_dir: u64,
+        entry: &DirectoryEntry,
+    ) -> FsResult<DirectoryEntryStorage> {
         let parent_path = self.contents_path(ino_contents_dir);
         let hash_dir = parent_path.join(HASH_DIR);
         let ls_dir = parent_path.join(LS_DIR);
@@ -2387,6 +2598,15 @@ impl EncryptedFs {
         } else {
             crypto::encrypt_file_name(&entry.name, self.cipher, &*self.key.get().await?)?
         };
+        Ok(DirectoryEntryStorage {
+            entry: entry.clone(),
+            hash_path: storage_entry_path(&hash_dir, &hash_name),
+            ls_path: storage_entry_path(&ls_dir, &encrypted_name),
+            encrypted_name,
+        })
+    }
+
+    async fn write_directory_entry_storage(&self, storage: &DirectoryEntryStorage) -> FsResult<()> {
         // add to LS directory
         let self_clone = self
             .self_weak
@@ -2396,22 +2616,18 @@ impl EncryptedFs {
             .unwrap()
             .upgrade()
             .unwrap();
-        let ls_dir_clone = ls_dir.clone();
-        let encrypted_name_clone = encrypted_name.clone();
-        let entry_clone = entry.clone();
+        let ls_path = storage.ls_path.clone();
+        let entry_clone = storage.entry.clone();
         // spawn a task to do concurrently with adding to HASH directory
         let h = tokio::spawn(async move {
-            let file_path = storage_entry_path(&ls_dir_clone, &encrypted_name_clone);
             let lock = self_clone
                 .serialize_dir_entries_ls_locks
-                .get_or_insert_with(file_path.to_str().unwrap().to_owned(), || {
-                    RwLock::new(false)
-                });
+                .get_or_insert_with(ls_path.to_str().unwrap().to_owned(), || RwLock::new(false));
             let _guard = lock.write().await;
             // write inode and file type
             let entry = (entry_clone.ino, entry_clone.kind);
             crypto::atomic_serialize_encrypt_into(
-                &file_path,
+                &ls_path,
                 &entry,
                 self_clone.cipher,
                 &*self_clone.key.get().await?,
@@ -2427,12 +2643,13 @@ impl EncryptedFs {
             .unwrap()
             .upgrade()
             .unwrap();
-        let entry_hash = entry.clone();
-        tokio::spawn(async move {
-            let file_path = storage_entry_path(&hash_dir, &hash_name);
+        let entry_hash = storage.entry.clone();
+        let encrypted_name = storage.encrypted_name.clone();
+        let hash_path = storage.hash_path.clone();
+        let hash_result = tokio::spawn(async move {
             let lock = self_clone
                 .serialize_dir_entries_hash_locks
-                .get_or_insert_with(file_path.to_str().unwrap().to_owned(), || {
+                .get_or_insert_with(hash_path.to_str().unwrap().to_owned(), || {
                     RwLock::new(false)
                 });
             let _guard = lock.write().await;
@@ -2440,16 +2657,94 @@ impl EncryptedFs {
             // we save the encrypted name also because we need it to remove the entry on [`remove_directory_entry`]
             let entry = (entry_hash.ino, entry_hash.kind, encrypted_name);
             crypto::atomic_serialize_encrypt_into(
-                &file_path,
+                &hash_path,
                 &entry,
                 self_clone.cipher,
                 &*self_clone.key.get().await?,
             )?;
             Ok::<(), FsError>(())
         })
-        .await??;
-        h.await??;
+        .await?;
+        let ls_result = h.await?;
+        hash_result?;
+        ls_result?;
+        self.dir_entries_meta_cache
+            .get()
+            .await?
+            .lock()
+            .await
+            .pop(&storage.ls_path.to_string_lossy().to_string());
         Ok(())
+    }
+
+    async fn find_directory_entry_storage(
+        &self,
+        parent: u64,
+        name: &SecretString,
+    ) -> FsResult<Option<DirectoryEntryStorage>> {
+        let parent_path = self.contents_path(parent);
+        let hash_dir = parent_path.join(HASH_DIR);
+        let Some(hash_path) = crypto::hash_file_name_candidates(name)
+            .into_iter()
+            .map(|hash| storage_entry_path(&hash_dir, &hash))
+            .find(|path| path.is_file())
+        else {
+            return Ok(None);
+        };
+        let lock = self
+            .serialize_dir_entries_hash_locks
+            .get_or_insert_with(hash_path.to_str().unwrap().to_owned(), || {
+                RwLock::new(false)
+            });
+        let guard = lock.read().await;
+        let (ino, kind, encrypted_name): (u64, FileType, String) =
+            bincode::deserialize_from(crypto::create_read(
+                File::open(&hash_path)?,
+                self.cipher,
+                &*self.key.get().await?,
+            ))?;
+        drop(guard);
+        Ok(Some(DirectoryEntryStorage {
+            entry: DirectoryEntry {
+                ino,
+                name: name.clone(),
+                kind,
+            },
+            hash_path,
+            ls_path: storage_entry_path(&parent_path.join(LS_DIR), &encrypted_name),
+            encrypted_name,
+        }))
+    }
+
+    async fn remove_directory_entry_hash_file(&self, path: &Path) -> FsResult<()> {
+        let lock = self
+            .serialize_dir_entries_hash_locks
+            .get_or_insert_with(path.to_str().unwrap().to_owned(), || RwLock::new(false));
+        let _guard = lock.write().await;
+        match fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    async fn remove_directory_entry_ls_file(&self, path: &Path) -> FsResult<()> {
+        let lock = self
+            .serialize_dir_entries_ls_locks
+            .get_or_insert_with(path.to_str().unwrap().to_owned(), || RwLock::new(false));
+        let _guard = lock.write().await;
+        let result = match fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        };
+        self.dir_entries_meta_cache
+            .get()
+            .await?
+            .lock()
+            .await
+            .pop(&path.to_string_lossy().to_string());
+        result
     }
 
     fn ino_file(&self, ino: u64) -> PathBuf {
@@ -2461,33 +2756,14 @@ impl EncryptedFs {
     }
 
     async fn remove_directory_entry(&self, parent: u64, name: &SecretString) -> FsResult<()> {
-        let parent_path = self.contents_path(parent);
-        // remove from HASH
-        let hash_dir = parent_path.join(HASH_DIR);
-        let path = crypto::hash_file_name_candidates(name)
-            .into_iter()
-            .map(|hash| storage_entry_path(&hash_dir, &hash))
-            .find(|path| path.is_file())
+        let storage = self
+            .find_directory_entry_storage(parent, name)
+            .await?
             .ok_or(FsError::NotFound("directory entry not found"))?;
-        let lock = self
-            .serialize_dir_entries_hash_locks
-            .get_or_insert_with(path.to_str().unwrap().to_owned(), || RwLock::new(false));
-        let guard = lock.write().await;
-        let (_, _, name): (u64, FileType, String) =
-            bincode::deserialize_from(crypto::create_read(
-                File::open(path.clone())?,
-                self.cipher,
-                &*self.key.get().await?,
-            ))?;
-        fs::remove_file(path)?;
-        drop(guard);
-        // remove from LS
-        let path = storage_entry_path(&parent_path.join(LS_DIR), &name);
-        let lock = self
-            .serialize_dir_entries_ls_locks
-            .get_or_insert_with(path.to_str().unwrap().to_owned(), || RwLock::new(false));
-        let _guard = lock.write().await;
-        fs::remove_file(path)?;
+        self.remove_directory_entry_hash_file(&storage.hash_path)
+            .await?;
+        self.remove_directory_entry_ls_file(&storage.ls_path)
+            .await?;
         Ok(())
     }
 

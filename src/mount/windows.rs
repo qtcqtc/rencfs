@@ -500,17 +500,13 @@ impl FileSystemInterface for WindowsFs {
         if parent == new_parent && name.expose_secret() == new_name.expose_secret() {
             return Ok(());
         }
-        if let Some(existing) = self.block_on(self.fs.find_by_name(new_parent, &new_name))? {
-            if !replace_if_exists {
-                return Err(STATUS_OBJECT_NAME_COLLISION);
-            }
-            if existing.kind == FileType::Directory {
-                self.block_on(self.fs.remove_dir(new_parent, &new_name))?;
-            } else {
-                self.block_on(self.fs.remove_file(new_parent, &new_name))?;
-            }
-        }
-        self.block_on(self.fs.rename(parent, &name, new_parent, &new_name))
+        self.block_on(self.fs.rename_with_options(
+            parent,
+            &name,
+            new_parent,
+            &new_name,
+            replace_if_exists,
+        ))
     }
 
     const GET_SECURITY_DEFINED: bool = true;
@@ -549,9 +545,7 @@ impl FileSystemInterface for WindowsFs {
             entries.sort_by(|left, right| left.0.cmp(&right.0));
             *cached_entries = Some(entries);
         }
-        let entries = cached_entries.as_ref().unwrap().clone();
-        drop(cached_entries);
-
+        let entries = cached_entries.as_ref().unwrap();
         let mut exhausted = true;
         for (name, info) in entries {
             if marker
@@ -560,20 +554,17 @@ impl FileSystemInterface for WindowsFs {
             {
                 continue;
             }
+            // DirInfo reserves one UTF-16 unit for the trailing NUL.
             if name.encode_utf16().count() >= 255 {
                 continue;
             }
-            if !add_dir_info(DirInfo::from_str(info, &name)) {
+            if !add_dir_info(DirInfo::from_str(*info, name)) {
                 exhausted = false;
                 break;
             }
         }
         if exhausted {
-            file_context
-                .directory_entries
-                .lock()
-                .map_err(|_| STATUS_INVALID_HANDLE)?
-                .take();
+            cached_entries.take();
         }
         Ok(())
     }
@@ -893,7 +884,7 @@ mod tests {
             ))
             .unwrap();
 
-        let adapter = WindowsFs::new(encrypted_fs, false).unwrap();
+        let adapter = WindowsFs::new(encrypted_fs.clone(), false).unwrap();
         let original_name = U16CString::from_str(r"\hello.txt").unwrap();
         let renamed_name = U16CString::from_str(r"\renamed.txt").unwrap();
         let replacement_name = U16CString::from_str(r"\replacement.txt").unwrap();
@@ -979,6 +970,7 @@ mod tests {
             )
             .unwrap();
         adapter.close(replacement_context);
+        let replaced_ino = adapter.resolve_path(&replacement_name).unwrap().ino;
         let (rename_context, _) = adapter
             .open(
                 &renamed_name,
@@ -986,6 +978,17 @@ mod tests {
                 FileAccessRights::FILE_GENERIC_READ | FileAccessRights::DELETE,
             )
             .unwrap();
+        assert_eq!(
+            adapter.rename(
+                rename_context.clone(),
+                &renamed_name,
+                &replacement_name,
+                false,
+            ),
+            Err(STATUS_OBJECT_NAME_COLLISION)
+        );
+        assert!(adapter.resolve_path(&renamed_name).is_ok());
+        assert_eq!(adapter.resolve_path(&replacement_name).unwrap().size, 0);
         adapter
             .rename(
                 rename_context.clone(),
@@ -1000,6 +1003,8 @@ mod tests {
             adapter.resolve_path(&replacement_name).unwrap().size,
             payload.len() as u64
         );
+        assert!(!encrypted_fs.exists(replaced_ino));
+        assert!(!encrypted_fs.is_file(replaced_ino));
 
         let (delete_context, _) = adapter
             .open(
